@@ -96,9 +96,8 @@ vertical = 2
 ```
 
 For comprehensive configuration guides, benchmarks, and conversion notes, see:
-- 📖 [**Kitty Features Guide**](docs/kitty-features-guide.md)
-- 📝 [**Hybrid Graphics Implementation Log**](docs/hybrid-kitty-graphics-log.md)
-- 🔍 [**Cursor Trail Porting Architecture**](docs/cursor-trail-port.md)
+- 📖 [**Kitty Features & Configuration Guide**](docs/kitty-features-guide.md)
+- 📝 [**Graphics Pipeline & Decoupled Architecture**](docs/graphics-architecture.md)
 
 ---
 
