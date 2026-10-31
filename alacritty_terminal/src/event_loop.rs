@@ -15,6 +15,7 @@ use log::error;
 use polling::{Event as PollingEvent, Events, PollMode, Poller};
 
 use crate::event::{self, Event, EventListener, WindowSize};
+use crate::graphics::{GraphicsStreamItem, GraphicsStreamParser};
 use crate::sync::FairMutex;
 use crate::term::Term;
 use crate::{thread, tty};
@@ -151,7 +152,12 @@ where
             }
 
             // Parse the incoming bytes.
-            state.parser.advance(&mut **terminal, &buf[..unprocessed]);
+            let terminal = &mut **terminal;
+            let parser = &mut state.parser;
+            state.graphics_parser.advance(&buf[..unprocessed], |item| match item {
+                GraphicsStreamItem::Text(text) => parser.advance(terminal, text),
+                GraphicsStreamItem::Graphics(bytes) => terminal.handle_kitty_graphics(&bytes),
+            });
 
             processed += unprocessed;
             unprocessed = 0;
@@ -402,6 +408,7 @@ pub struct State {
     write_list: VecDeque<Cow<'static, [u8]>>,
     writing: Option<Writing>,
     parser: ansi::Processor,
+    graphics_parser: GraphicsStreamParser,
 }
 
 impl State {

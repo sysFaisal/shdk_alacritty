@@ -14,6 +14,7 @@ use log::{debug, trace};
 use unicode_width::UnicodeWidthChar;
 
 use crate::event::{Event, EventListener};
+use crate::graphics::{GraphicsCommand, GraphicsState};
 use crate::grid::{Dimensions, Grid, GridIterator, Scroll};
 use crate::index::{self, Boundary, Column, Direction, Line, Point, Side};
 use crate::selection::{Selection, SelectionRange, SelectionType};
@@ -325,6 +326,13 @@ pub struct Term<T> {
     /// Information about damaged cells.
     damage: TermDamageState,
 
+    /// Kitty graphics protocol state.
+    pub graphics: GraphicsState,
+
+    /// Pixel dimensions of a cell for graphics scaling.
+    pub cell_width: f32,
+    pub cell_height: f32,
+
     /// Config directly for the terminal.
     config: Config,
 }
@@ -386,6 +394,45 @@ pub enum Osc52 {
 
 impl<T> Term<T> {
     #[inline]
+    pub fn set_cell_size(&mut self, width: f32, height: f32) {
+        self.cell_width = width;
+        self.cell_height = height;
+    }
+
+    #[inline]
+    pub fn handle_kitty_graphics(&mut self, bytes: &[u8])
+    where
+        T: EventListener,
+    {
+        if let Some(cmd) = GraphicsCommand::parse(bytes) {
+            let cursor = self.grid.cursor.point;
+            let (reply, advance) = self.graphics.process_command(
+                cmd,
+                cursor,
+                self.cell_width,
+                self.cell_height,
+            );
+            if let Some(reply) = reply {
+                self.event_proxy.send_event(Event::PtyWrite(reply));
+            }
+            if let Some((cols, lines, _)) = advance {
+                // Scroll if needed to fit the image, then move cursor.
+                let screen_lines = self.screen_lines();
+                let last_row = cursor.line.0 + (lines as i32).saturating_sub(1);
+                let overflow = last_row - (screen_lines as i32 - 1);
+                if overflow > 0 {
+                    self.scroll_up(overflow as usize);
+                }
+                let target_col = cursor.column.0 + cols;
+                let target_line = (cursor.line.0 + (lines as i32).saturating_sub(1))
+                    .min(screen_lines as i32 - 1);
+                self.goto(target_line, target_col);
+            }
+            self.mark_fully_damaged();
+        }
+    }
+
+    #[inline]
     pub fn scroll_display(&mut self, scroll: Scroll)
     where
         T: EventListener,
@@ -427,6 +474,9 @@ impl<T> Term<T> {
             scroll_region,
             event_proxy,
             damage,
+            graphics: GraphicsState::new(),
+            cell_width: 10.0,
+            cell_height: 20.0,
             config,
             grid,
             tabs,
@@ -778,6 +828,7 @@ impl<T> Term<T> {
         self.selection = self.selection.take().and_then(|s| s.rotate(self, &region, lines as i32));
 
         self.grid.scroll_up(&region, lines);
+        self.graphics.scroll(lines);
 
         // Scroll vi mode cursor.
         let viewport_top = Line(-(self.grid.display_offset() as i32));
