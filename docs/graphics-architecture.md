@@ -87,3 +87,24 @@ Direct placement with UV crop               Grid cells hold U+10EEEE
 ## 4. Unicode Diacritic Mapping
 
 Row and column indexing in Kitty's Unicode placeholder protocol uses combining diacritics mapped according to Kitty's 310-entry codepoint table (`diacritic_to_num`). This ensures 100% protocol compliance and accurate grid alignment for multi-tile image displays.
+
+---
+
+## 5. Performance Optimizations & Production Safeguards
+
+### A. Batch Quad Rendering
+- **Problem:** Individual `glDrawArrays` and `glBufferSubData` calls per placeholder tile generated thousands of draw calls per frame on large image previews.
+- **Solution:** Quads are batched per unique OpenGL texture. All tiles and placements sharing the same image are uploaded into a single dynamic vertex buffer and rendered in **one single `glDrawArrays(gl::TRIANGLES, ...)` call per texture**.
+
+### B. Lazy GPU VRAM Texture Upload
+- **Problem:** Eagerly uploading every stored image to GPU VRAM caused unbounded texture memory usage when scrolling or loading multiple files in Yazi.
+- **Solution:** Only textures for images currently visible in the active viewport (or referenced by current placeholder tiles) are uploaded to OpenGL VRAM. Offscreen images remain in host RAM until needed.
+
+### C. Z-Index Layering (UnderText vs OverText Passes)
+- Kitty protocol specifies that images with `z_index < 0` must render underneath terminal text, while `z_index >= 0` render above text.
+- `Renderer::draw_images` runs in two passes: `ImageZPass::UnderText` (before `draw_cells`) and `ImageZPass::OverText` (after `draw_cells`), ensuring accurate visual stacking.
+
+### D. LRU Memory Cap & Parser Safeguards
+- A 256MB memory cap with LRU eviction prevents unbounded RAM growth in `GraphicsState`.
+- `GraphicsStreamParser` enforces a 128MB maximum payload buffer to guard against malformed or unterminated escape sequences.
+- Cursor trail delta time (`dt`) is clamped between 1ms and 50ms to eliminate visual spikes during background tab switching.

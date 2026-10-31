@@ -183,12 +183,31 @@ impl Renderer {
         Ok(Self { text_renderer, rect_renderer, trail_renderer, image_renderer, robustness })
     }
 
+    #[inline]
+    fn restore_text_blend_mode(&self) {
+        unsafe {
+            match &self.text_renderer {
+                TextRendererProvider::Glsl3(_) => {
+                    gl::BlendFunc(gl::SRC1_COLOR, gl::ONE_MINUS_SRC1_COLOR);
+                },
+                TextRendererProvider::Gles2(renderer) => {
+                    if renderer.dual_source_blending() {
+                        gl::BlendFunc(gl::SRC1_COLOR, gl::ONE_MINUS_SRC1_COLOR);
+                    } else {
+                        gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
+                    }
+                },
+            }
+        }
+    }
+
     pub fn draw_images(
         &mut self,
         size_info: &SizeInfo,
         graphics: &GraphicsState,
         display_offset: usize,
         tiles: &[PlaceholderTile],
+        z_pass: ImageZPass,
     ) {
         if graphics.placements().is_empty() && tiles.is_empty() && graphics.images().is_empty() {
             return;
@@ -200,12 +219,10 @@ impl Renderer {
             gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
         }
 
-        self.image_renderer.draw(size_info, graphics, display_offset, tiles);
+        self.image_renderer.draw(size_info, graphics, display_offset, tiles, z_pass);
 
-        unsafe {
-            gl::BlendFunc(gl::SRC1_COLOR, gl::ONE_MINUS_SRC1_COLOR);
-            self.set_viewport(size_info);
-        }
+        self.restore_text_blend_mode();
+        self.set_viewport(size_info);
 
         match &mut self.text_renderer {
             TextRendererProvider::Gles2(renderer) => renderer.reset_active_tex(),
@@ -311,10 +328,8 @@ impl Renderer {
             gl::BlendFunc(gl::ONE, gl::ONE_MINUS_SRC_ALPHA);
         }
         self.trail_renderer.draw(trail);
-        unsafe {
-            gl::BlendFunc(gl::SRC1_COLOR, gl::ONE_MINUS_SRC1_COLOR);
-            self.set_viewport(size_info);
-        }
+        self.restore_text_blend_mode();
+        self.set_viewport(size_info);
     }
 
     /// Fill the window with `color` and `alpha`.
@@ -482,6 +497,34 @@ impl Drop for TrailRenderer {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageZPass {
+    UnderText,
+    OverText,
+}
+
+#[inline]
+fn append_quad(
+    buf: &mut Vec<f32>,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    u0: f32,
+    v0: f32,
+    u1: f32,
+    v1: f32,
+) {
+    buf.extend_from_slice(&[
+        left, top, u0, v0,
+        left, bottom, u0, v1,
+        right, bottom, u1, v1,
+        left, top, u0, v0,
+        right, bottom, u1, v1,
+        right, top, u1, v0,
+    ]);
+}
+
 const IMAGE_SHADER_V: &str = include_str!("../../res/image.v.glsl");
 const IMAGE_SHADER_F: &str = include_str!("../../res/image.f.glsl");
 
@@ -491,6 +534,7 @@ struct ImageRenderer {
     vao: gl::types::GLuint,
     vbo: gl::types::GLuint,
     textures: HashMap<u32, (gl::types::GLuint, u64)>,
+    batch_buffers: HashMap<gl::types::GLuint, Vec<f32>>,
 }
 
 impl ImageRenderer {
@@ -502,12 +546,6 @@ impl ImageRenderer {
             gl::GenBuffers(1, &mut vbo);
             gl::BindVertexArray(vao);
             gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
-            gl::BufferData(
-                gl::ARRAY_BUFFER,
-                (4 * 4 * std::mem::size_of::<f32>()) as isize,
-                std::ptr::null(),
-                gl::DYNAMIC_DRAW,
-            );
             gl::VertexAttribPointer(
                 0,
                 2,
@@ -532,7 +570,13 @@ impl ImageRenderer {
             gl::BindVertexArray(0);
         }
 
-        Ok(Self { program, vao, vbo, textures: HashMap::new() })
+        Ok(Self {
+            program,
+            vao,
+            vbo,
+            textures: HashMap::new(),
+            batch_buffers: HashMap::new(),
+        })
     }
 
     fn draw(
@@ -541,12 +585,14 @@ impl ImageRenderer {
         graphics: &GraphicsState,
         display_offset: usize,
         tiles: &[PlaceholderTile],
+        z_pass: ImageZPass,
     ) {
         if graphics.placements().is_empty() && tiles.is_empty() && graphics.images().is_empty() {
             return;
         }
 
         unsafe {
+            // 1. Remove deleted textures
             self.textures.retain(|id, (tex, _)| {
                 if !graphics.images().contains_key(id) {
                     gl::DeleteTextures(1, tex);
@@ -556,7 +602,40 @@ impl ImageRenderer {
                 }
             });
 
-            for (id, img) in graphics.images() {
+            // 2. Identify visible images in this pass and upload only their textures (Lazy VRAM Upload)
+            let mut needed_images = HashSet::new();
+
+            // Direct placements matching z_pass
+            for placement in graphics.placements() {
+                let matches_z = match z_pass {
+                    ImageZPass::UnderText => placement.z_index < 0,
+                    ImageZPass::OverText => placement.z_index >= 0,
+                };
+                if !matches_z {
+                    continue;
+                }
+
+                let viewport_line = placement.line.0 + display_offset as i32;
+                if viewport_line + (placement.lines as i32) > 0
+                    && (viewport_line as usize) < size_info.screen_lines()
+                {
+                    needed_images.insert(placement.image_id);
+                }
+            }
+
+            // Placeholder tiles only render on OverText pass
+            if z_pass == ImageZPass::OverText {
+                for tile in tiles {
+                    needed_images.insert(tile.image_id);
+                }
+            }
+
+            if needed_images.is_empty() {
+                return;
+            }
+
+            for id in &needed_images {
+                let Some(img) = graphics.images().get(id) else { continue };
                 match self.textures.get_mut(id) {
                     Some((tex, version)) => {
                         if *version != img.version {
@@ -580,10 +659,26 @@ impl ImageRenderer {
                         let mut tex = 0;
                         gl::GenTextures(1, &mut tex);
                         gl::BindTexture(gl::TEXTURE_2D, tex);
-                        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
-                        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
-                        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
-                        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
+                        gl::TexParameteri(
+                            gl::TEXTURE_2D,
+                            gl::TEXTURE_MIN_FILTER,
+                            gl::LINEAR as i32,
+                        );
+                        gl::TexParameteri(
+                            gl::TEXTURE_2D,
+                            gl::TEXTURE_MAG_FILTER,
+                            gl::LINEAR as i32,
+                        );
+                        gl::TexParameteri(
+                            gl::TEXTURE_2D,
+                            gl::TEXTURE_WRAP_S,
+                            gl::CLAMP_TO_EDGE as i32,
+                        );
+                        gl::TexParameteri(
+                            gl::TEXTURE_2D,
+                            gl::TEXTURE_WRAP_T,
+                            gl::CLAMP_TO_EDGE as i32,
+                        );
                         gl::TexImage2D(
                             gl::TEXTURE_2D,
                             0,
@@ -601,16 +696,21 @@ impl ImageRenderer {
                 }
             }
 
-            while gl::GetError() != gl::NO_ERROR {}
-            gl::UseProgram(self.program.id());
-            gl::Enable(gl::BLEND);
-            gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
-            gl::BindVertexArray(self.vao);
+            // 3. Clear batch buffers
+            for buf in self.batch_buffers.values_mut() {
+                buf.clear();
+            }
 
-            let mut current_bound_tex = 0;
-
-            // 1. Draw direct placements
+            // 4. Batch direct placements
             for placement in graphics.placements() {
+                let matches_z = match z_pass {
+                    ImageZPass::UnderText => placement.z_index < 0,
+                    ImageZPass::OverText => placement.z_index >= 0,
+                };
+                if !matches_z {
+                    continue;
+                }
+
                 let Some(&(tex, _)) = self.textures.get(&placement.image_id) else { continue };
                 let Some(img) = graphics.images().get(&placement.image_id) else { continue };
 
@@ -647,76 +747,64 @@ impl ImageRenderer {
                 let u1 = (placement.src_x + src_w) as f32 / img.width.max(1) as f32;
                 let v1 = (placement.src_y + src_h) as f32 / img.height.max(1) as f32;
 
-                let quad: [f32; 16] = [
-                    left_ndc, top_ndc, u0, v0,
-                    left_ndc, bottom_ndc, u0, v1,
-                    right_ndc, bottom_ndc, u1, v1,
-                    right_ndc, top_ndc, u1, v0,
-                ];
-
-                if current_bound_tex != tex {
-                    gl::BindTexture(gl::TEXTURE_2D, tex);
-                    current_bound_tex = tex;
-                }
-
-                gl::BindBuffer(gl::ARRAY_BUFFER, self.vbo);
-                gl::BufferSubData(
-                    gl::ARRAY_BUFFER,
-                    0,
-                    (16 * std::mem::size_of::<f32>()) as isize,
-                    quad.as_ptr().cast(),
-                );
-                gl::BindBuffer(gl::ARRAY_BUFFER, 0);
-
-                gl::DrawArrays(gl::TRIANGLE_FAN, 0, 4);
+                let buf = self.batch_buffers.entry(tex).or_default();
+                append_quad(buf, left_ndc, top_ndc, right_ndc, bottom_ndc, u0, v0, u1, v1);
             }
 
-            // 2. Draw Unicode placeholder tiles (U=1)
-            for tile in tiles {
-                let Some(&(tex, _)) = self.textures.get(&tile.image_id) else { continue };
-                let vp = graphics.virtual_placements().get(&tile.image_id);
-                let total_cols = vp.map_or(1, |v| v.columns.max(1));
-                let total_lines = vp.map_or(1, |v| v.lines.max(1));
+            // 5. Batch Unicode placeholder tiles (U=1) (only on OverText pass)
+            if z_pass == ImageZPass::OverText {
+                for tile in tiles {
+                    let Some(&(tex, _)) = self.textures.get(&tile.image_id) else { continue };
+                    let vp = graphics.virtual_placements().get(&tile.image_id);
+                    let total_cols = vp.map_or(1, |v| v.columns.max(1));
+                    let total_lines = vp.map_or(1, |v| v.lines.max(1));
 
-                let u0 = (tile.col as f32) / (total_cols as f32);
-                let u1 = ((tile.col + 1) as f32) / (total_cols as f32);
-                let v0 = (tile.row as f32) / (total_lines as f32);
-                let v1 = ((tile.row + 1) as f32) / (total_lines as f32);
+                    let u0 = (tile.col as f32) / (total_cols as f32);
+                    let u1 = ((tile.col + 1) as f32) / (total_cols as f32);
+                    let v0 = (tile.row as f32) / (total_lines as f32);
+                    let v1 = ((tile.row + 1) as f32) / (total_lines as f32);
 
-                let x = size_info.padding_x() + tile.point.column.0 as f32 * size_info.cell_width();
-                let y = size_info.padding_y() + tile.point.line as f32 * size_info.cell_height();
-                let w = size_info.cell_width();
-                let h = size_info.cell_height();
+                    let x = size_info.padding_x()
+                        + tile.point.column.0 as f32 * size_info.cell_width();
+                    let y = size_info.padding_y()
+                        + tile.point.line as f32 * size_info.cell_height();
+                    let w = size_info.cell_width();
+                    let h = size_info.cell_height();
 
-                let left_ndc = (x / size_info.width()) * 2.0 - 1.0;
-                let right_ndc = ((x + w) / size_info.width()) * 2.0 - 1.0;
-                let top_ndc = 1.0 - (y / size_info.height()) * 2.0;
-                let bottom_ndc = 1.0 - ((y + h) / size_info.height()) * 2.0;
+                    let left_ndc = (x / size_info.width()) * 2.0 - 1.0;
+                    let right_ndc = ((x + w) / size_info.width()) * 2.0 - 1.0;
+                    let top_ndc = 1.0 - (y / size_info.height()) * 2.0;
+                    let bottom_ndc = 1.0 - ((y + h) / size_info.height()) * 2.0;
 
-                let quad: [f32; 16] = [
-                    left_ndc, top_ndc, u0, v0,
-                    left_ndc, bottom_ndc, u0, v1,
-                    right_ndc, bottom_ndc, u1, v1,
-                    right_ndc, top_ndc, u1, v0,
-                ];
-
-                if current_bound_tex != tex {
-                    gl::BindTexture(gl::TEXTURE_2D, tex);
-                    current_bound_tex = tex;
+                    let buf = self.batch_buffers.entry(tex).or_default();
+                    append_quad(buf, left_ndc, top_ndc, right_ndc, bottom_ndc, u0, v0, u1, v1);
                 }
-
-                gl::BindBuffer(gl::ARRAY_BUFFER, self.vbo);
-                gl::BufferSubData(
-                    gl::ARRAY_BUFFER,
-                    0,
-                    (16 * std::mem::size_of::<f32>()) as isize,
-                    quad.as_ptr().cast(),
-                );
-                gl::BindBuffer(gl::ARRAY_BUFFER, 0);
-
-                gl::DrawArrays(gl::TRIANGLE_FAN, 0, 4);
             }
 
+            // 6. Execute batched draw: 1 glDrawArrays per unique texture!
+            while gl::GetError() != gl::NO_ERROR {}
+            gl::UseProgram(self.program.id());
+            gl::Enable(gl::BLEND);
+            gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
+            gl::BindVertexArray(self.vao);
+            gl::BindBuffer(gl::ARRAY_BUFFER, self.vbo);
+
+            for (&tex, vertices) in &self.batch_buffers {
+                if vertices.is_empty() {
+                    continue;
+                }
+                gl::BindTexture(gl::TEXTURE_2D, tex);
+                gl::BufferData(
+                    gl::ARRAY_BUFFER,
+                    (vertices.len() * std::mem::size_of::<f32>()) as isize,
+                    vertices.as_ptr().cast(),
+                    gl::DYNAMIC_DRAW,
+                );
+                let vertex_count = (vertices.len() / 4) as i32;
+                gl::DrawArrays(gl::TRIANGLES, 0, vertex_count);
+            }
+
+            gl::BindBuffer(gl::ARRAY_BUFFER, 0);
             gl::ActiveTexture(gl::TEXTURE0);
             gl::BindTexture(gl::TEXTURE_2D, 0);
             gl::BindVertexArray(0);

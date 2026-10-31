@@ -54,7 +54,7 @@ use crate::display::window::Window;
 use crate::event::{Event, EventType, Mouse, SearchState};
 use crate::message_bar::{MessageBuffer, MessageType};
 use crate::renderer::rects::{RenderLine, RenderLines, RenderRect};
-use crate::renderer::{self, GlyphCache, Renderer, platform};
+use crate::renderer::{self, GlyphCache, ImageZPass, Renderer, platform};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::string::{ShortenDirection, StrShortener};
 
@@ -935,6 +935,14 @@ impl Display {
             }
         }
 
+        self.renderer.draw_images(
+            &size_info,
+            &graphics,
+            display_offset,
+            &placeholder_tiles,
+            ImageZPass::UnderText,
+        );
+
         // Draw grid.
         {
             let _sampler = self.meter.sampler();
@@ -971,7 +979,13 @@ impl Display {
             self.renderer.draw_cells(&size_info, glyph_cache, cells);
         }
 
-        self.renderer.draw_images(&size_info, &graphics, display_offset, &placeholder_tiles);
+        self.renderer.draw_images(
+            &size_info,
+            &graphics,
+            display_offset,
+            &placeholder_tiles,
+            ImageZPass::OverText,
+        );
 
         if config.cursor.trail.enabled {
             let trail = self.cursor_trail.update(
@@ -1031,7 +1045,7 @@ impl Display {
             if !scheduler.scheduled(timer_id) {
                 scheduler.schedule(
                     Event::new(EventType::Frame, self.window.id()),
-                    Duration::from_millis(16),
+                    Duration::from_millis(8),
                     false,
                     timer_id,
                 );

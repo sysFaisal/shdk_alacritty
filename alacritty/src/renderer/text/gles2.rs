@@ -156,6 +156,11 @@ impl Gles2Renderer {
             dual_source_blending,
         })
     }
+
+    #[inline]
+    pub fn dual_source_blending(&self) -> bool {
+        self.dual_source_blending
+    }
 }
 
 impl Drop for Gles2Renderer {
