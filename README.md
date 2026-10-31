@@ -1,114 +1,139 @@
 <p align="center">
-    <img width="200" alt="Alacritty Logo" src="https://raw.githubusercontent.com/alacritty/alacritty/master/extra/logo/compat/alacritty-term%2Bscanlines.png">
+  <img width="180" alt="Alacritty Custom Logo" src="https://raw.githubusercontent.com/alacritty/alacritty/master/extra/logo/compat/alacritty-term%2Bscanlines.png">
 </p>
 
-<h1 align="center">Alacritty - A fast, cross-platform, OpenGL terminal emulator</h1>
+<h1 align="center">Shdk Alacritty</h1>
 
 <p align="center">
-  <img alt="Alacritty - A fast, cross-platform, OpenGL terminal emulator"
-       src="https://raw.githubusercontent.com/alacritty/alacritty/master/extra/promo/alacritty-readme.png">
+  <strong>High-performance, GPU-accelerated terminal emulator enhanced with Kitty Cursor Trails, Kitty Graphics Protocol, and Ghostty-inspired Cell Architecture.</strong>
 </p>
 
-## About
+<p align="center">
+  <a href="#about"><img src="https://img.shields.io/badge/upstream-Alacritty-blue?style=flat-square" alt="Upstream Alacritty"></a>
+  <a href="#features"><img src="https://img.shields.io/badge/features-Kitty%20%7C%20Ghostty-orange?style=flat-square" alt="Kitty & Ghostty Features"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-GPL--3.0-green?style=flat-square" alt="GPL-3.0 License"></a>
+  <a href="#quick-start"><img src="https://img.shields.io/badge/build-Rust%20%2F%20Cargo-red?style=flat-square" alt="Rust Build"></a>
+</p>
 
-Alacritty is a modern terminal emulator that comes with sensible defaults, but
-allows for extensive [configuration](#configuration). By integrating with other
-applications, rather than reimplementing their functionality, it manages to
-provide a flexible set of [features](./docs/features.md) with high performance.
-The supported platforms currently consist of BSD, Linux, macOS and Windows.
+---
 
-The software is considered to be at a **beta** level of readiness; there are
-a few missing features and bugs to be fixed, but it is already used by many as
-a daily driver.
+## 📖 About This Fork
 
-Precompiled binaries are available from the [GitHub releases page](https://github.com/alacritty/alacritty/releases).
+**`shdk_alacritty`** is a specialized fork of [**Alacritty**](https://github.com/alacritty/alacritty).
 
-Join [`#alacritty`] on libera.chat if you have questions or looking for a quick help.
+While upstream Alacritty prioritizes minimal feature complexity, modern terminal workflows frequently benefit from **rich graphics rendering** (e.g. in file managers like [Yazi](https://github.com/sxyazi/yazi), Neovim image plugins, CLI dashboards) and **fluid cursor animations**.
 
-[`#alacritty`]: https://web.libera.chat/gamja/?channels=#alacritty
+This fork merges the blazing-fast Rust core and OpenGL text pipeline of **Alacritty** with:
+1. **Kitty's GPU Cursor Trail:** Native 4-corner directional easing animations rendered via dedicated OpenGL shaders.
+2. **Kitty Graphics Protocol:** High-performance pixel streaming with direct placement and Unicode placeholder (`U=1`) support.
+3. **Ghostty-Inspired Cell Architecture:** Zero-bloat, decoupled cell grid synchronization keeping memory overhead minimal without breaking subpixel font rendering.
 
-## Features
+---
 
-You can find an overview over the features available in Alacritty [here](./docs/features.md).
+## ✨ Key Features & Enhancements
 
-## Further information
+### 🎯 1. Kitty GPU Cursor Trail (Ported from [Kitty](https://github.com/kovidgoyal/kitty))
+- **GPU-Warped Easing Quad:** Each corner of the cursor moves independently using Kitty's exponential decay formula with directional dot-product damping.
+- **Configurable Dynamics:** Fully tune decay speeds (`fast`, `slow`), distance thresholds, and enable/disable trails on the fly.
+- **Wayland & X11 Aware:** Frame-scheduler driven to ensure butter-smooth 60+ FPS animation even when terminal content is completely idle.
 
-- [Announcing Alacritty, a GPU-Accelerated Terminal Emulator](https://jwilm.io/blog/announcing-alacritty/) January 6, 2017
-- [A talk about Alacritty at the Rust Meetup January 2017](https://www.youtube.com/watch?v=qHOdYO3WUTk) January 19, 2017
-- [Alacritty Lands Scrollback, Publishes Benchmarks](https://jwilm.io/blog/alacritty-lands-scrollback/) September 17, 2018
+### 🖼️ 2. Kitty Graphics Protocol (Ported from [Kitty](https://github.com/kovidgoyal/kitty))
+- **Direct Image Placement (`U=0`):** Full support for RGB, RGBA, and PNG streaming escape sequences (`\x1b_G... \x1b\`).
+- **Unicode Placeholder Mode (`U=1`):** Complete compatibility with [Yazi](https://github.com/sxyazi/yazi), Neovim plugins, and modern CLI tools using Unicode `U+10EEEE` + diacritic row/column indexing.
+- **Terminal Scrolling Integration:** Images stay synchronized with terminal rows and cleanly scroll up with the grid.
 
-## Installation
+### 🏛️ 3. Ghostty-Inspired Decoupled Cell Architecture (Inspired by [Ghostty](https://github.com/ghostty-org/ghostty))
+- **Zero Memory Bloat:** Rather than enlarging `struct Cell` with heavy image references, image metadata is stored in an out-of-band texture cache (`HashMap<u32, StoredImage>`).
+- **Font Subpixel Blending Preservation:** Fixes texture cache poisoning and protects Alacritty’s Dual-Source Blending (`SRC1_COLOR, ONE_MINUS_SRC1_COLOR`) for crisp FreeType font anti-aliasing.
+- **Tofu Glyph Suppression:** Prevents missing-glyph tofu characters (`■`) from appearing when placeholder characters are received.
 
-Alacritty can be installed by using various package managers on Linux, BSD,
-macOS and Windows.
+---
 
-Prebuilt binaries for macOS and Windows can also be downloaded from the
-[GitHub releases page](https://github.com/alacritty/alacritty/releases).
+## 🚀 Quick Start
 
-For everyone else, the detailed instructions to install Alacritty can be found
-[here](INSTALL.md).
+### Prerequisites
+- Rust & Cargo (edition 2021+)
+- OpenGL / OpenGL ES 2.0+ capable GPU driver
+- Fontconfig, FreeType, and standard X11 / Wayland development libraries
 
-### Requirements
+### Building & Running
 
-- At least OpenGL ES 2.0
-- [Windows] ConPTY support (Windows 10 version 1809 or higher)
+```bash
+# Clone the repository
+git clone https://github.com/sysFaisal/shdk_alacritty.git
+cd shdk_alacritty
 
-## Configuration
+# Check and build with release optimizations
+cargo build --release
 
-You can find the documentation for Alacritty's configuration in `man 5
-alacritty`, or by looking at [the website] if you do not have the manpages
-installed.
+# Run your custom Alacritty
+./target/release/alacritty
+```
 
-[the website]: https://alacritty.org/config-alacritty.html
+---
 
-Alacritty doesn't create the config file for you, but it looks for one in the
-following locations:
+## ⚙️ Configuration
 
-1. `$XDG_CONFIG_HOME/alacritty/alacritty.toml`
-2. `$XDG_CONFIG_HOME/alacritty.toml`
-3. `$HOME/.config/alacritty/alacritty.toml`
-4. `$HOME/.alacritty.toml`
-5. `/etc/alacritty/alacritty.toml`
+Add the following to your `alacritty.toml` (usually located at `~/.config/alacritty/alacritty.toml`):
 
-On Windows, the config file will be looked for in:
+```toml
+[cursor]
+style = { shape = "Block", blinking = "Off" }
 
-* `%APPDATA%\alacritty\alacritty.toml`
+# Kitty Cursor Trail Configuration
+[cursor.trail]
+enabled = true
 
-## Contributing
+# Fast and slow decay timing in milliseconds
+[cursor.trail.decay]
+fast = 100
+slow = 400
 
-A guideline about contributing to Alacritty can be found in the
-[`CONTRIBUTING.md`](CONTRIBUTING.md) file.
+# Minimum movement in cells (horizontal, vertical) required to ignite the trail
+[cursor.trail.start_threshold]
+horizontal = 2
+vertical = 2
+```
 
-## FAQ
+For comprehensive configuration guides, benchmarks, and conversion notes, see:
+- 📖 [**Kitty Features Guide**](docs/kitty-features-guide.md)
+- 📝 [**Hybrid Graphics Implementation Log**](docs/hybrid-kitty-graphics-log.md)
+- 🔍 [**Cursor Trail Porting Architecture**](docs/cursor-trail-port.md)
 
-**_Is it really the fastest terminal emulator?_**
+---
 
-Benchmarking terminal emulators is complicated. Alacritty uses
-[vtebench](https://github.com/alacritty/vtebench) to quantify terminal emulator
-throughput and manages to consistently score better than the competition using
-it. If you have found an example where this is not the case, please report a
-bug.
+## 🗂️ Repository Structure
 
-Other aspects like latency or framerate and frame consistency are more difficult
-to quantify. Some terminal emulators also intentionally slow down to save
-resources, which might be preferred by some users.
+```text
+shdk_alacritty/
+├── alacritty/                  # Frontend, windowing, display loop & OpenGL renderer
+│   ├── res/
+│   │   ├── image.v.glsl        # Vertex shader for image quads & placeholder tiles
+│   │   ├── image.f.glsl        # Fragment shader for texture sampling & alpha
+│   │   ├── trail.v.glsl        # Kitty cursor trail vertex shader
+│   │   └── trail.f.glsl        # Kitty cursor trail fragment shader
+│   └── src/
+│       ├── config/cursor.rs    # Cursor trail TOML configuration bindings
+│       ├── display/            # Screen damaged tracking, grid pass & cursor animator
+│       └── renderer/           # GPU pipelines (text, rects, trails, images)
+├── alacritty_terminal/         # Headless terminal emulation core
+│   └── src/
+│       ├── graphics.rs         # Kitty protocol parser & decoupled image storage
+│       ├── event_loop.rs       # Stream interceptor for PTY graphics sequences
+│       └── term/               # Terminal grid, scroll sync & graphics handling
+├── docs/                       # Technical port logs, architecture & user guides
+├── test-config/                # Ready-to-use demo configurations
+└── LICENSE.md                  # Comprehensive GPL-3.0 licensing & upstream attributions
+```
 
-If you have doubts about Alacritty's performance or usability, the best way to
-quantify terminal emulators is always to test them with **your** specific
-usecases.
+---
 
-**_Why isn't feature X implemented?_**
+## ⚖️ License & Attributions
 
-Alacritty has many great features, but not every feature from every other
-terminal. This could be for a number of reasons, but sometimes it's just not a
-good fit for Alacritty. This means you won't find things like tabs or splits
-(which are best left to a window manager or [terminal multiplexer][tmux]) nor
-niceties like a GUI config editor.
+Due to the integration of ported algorithms and components from [**kitty**](https://github.com/kovidgoyal/kitty) (licensed under **GPL-3.0**), this combined repository is distributed under the terms of the **GNU General Public License v3.0 (GPL-3.0)**.
 
-[tmux]: https://github.com/tmux/tmux
+- **Alacritty Core:** Copyright (c) 2017-2024 Alacritty contributors (Apache-2.0 / MIT).
+- **Kitty Cursor Trail & Graphics Protocol:** Copyright (C) Kovid Goyal and kitty contributors (GPL-3.0).
+- **Decoupled Architecture Inspiration:** Inspired by Mitchell Hashimoto and the [Ghostty](https://github.com/ghostty-org/ghostty) project (MIT).
 
-## License
-
-Alacritty is released under the [Apache License, Version 2.0].
-
-[Apache License, Version 2.0]: https://github.com/alacritty/alacritty/blob/master/LICENSE-APACHE
+See [**`LICENSE.md`**](LICENSE.md) for full attribution breakdown and licensing text.
