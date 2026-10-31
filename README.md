@@ -1,6 +1,6 @@
 # shdk_alacritty
 
-just my personal fork of alacritty where i slapped together a few things i wanted for my own setup.
+just my personal fork of [alacritty](https://github.com/alacritty/alacritty) where i slapped together a few things i wanted for my own setup.
 
 basically:
 - ported the gpu cursor trail from kitty because it looks neat
@@ -12,6 +12,7 @@ basically:
 ## a quick heads up (read this first)
 
 this thing is pretty much pure vibe coding and a weekend side project.
+- only tested on linux (specifically arch linux on my own daily setup). haven't tested this on any other distro, let alone macos or windows
 - there will be bugs in certain edge cases, random glitches, or unhandled sequences
 - i made this primarily for myself, so expect rare to zero updates because honestly i'm too lazy to actively maintain or baby this repo
 - if it breaks or panics on your machine, you're pretty much on your own (or feel free to fork it and patch it yourself)
@@ -71,4 +72,11 @@ cargo build --release
 
 ## license
 
-since this ports math, shaders, and protocol parser code from kitty (which is GPL-3.0), the combined codebase is licensed under **GPL-3.0**. original alacritty code remains under Apache-2.0 / MIT. check `LICENSE.md` if you care about the legal details.
+This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)**.
+
+### Upstream Attributions & Licensing Breakdown
+- **[Alacritty Core](https://github.com/alacritty/alacritty):** Original codebase copyright (c) 2017-2024 Alacritty contributors, originally distributed under the Apache License 2.0 and MIT License (see `LICENSE-APACHE` and `LICENSE-MIT`).
+- **[kitty](https://github.com/kovidgoyal/kitty) Components:** GPU cursor trail easing formulas, decay math, and Kitty graphics protocol parser copyright (C) Kovid Goyal and kitty contributors, licensed under the GNU General Public License v3.0 (GPL-3.0).
+- **[Ghostty](https://github.com/ghostty-org/ghostty) Architecture:** Decoupled cell layout and out-of-band texture cache model inspired by Ghostty, copyright (c) Mitchell Hashimoto and Ghostty contributors (MIT).
+
+Under Section 5 of the GNU General Public License v3.0, combining GPL-3.0 ported code with Apache-2.0/MIT code requires the unified combined work to be distributed under **GPL-3.0**. Full legal text, copyright notices, and component breakdown are detailed in [**`LICENSE.md`**](LICENSE.md).
