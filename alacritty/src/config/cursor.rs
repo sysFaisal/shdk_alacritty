@@ -23,6 +23,51 @@ pub struct Cursor {
     thickness: Percentage,
     blink_interval: u64,
     blink_timeout: u8,
+
+    /// GPU cursor trail configuration.
+    pub trail: CursorTrail,
+}
+
+#[derive(ConfigDeserialize, Serialize, Copy, Clone, Debug, PartialEq)]
+pub struct CursorTrail {
+    /// Enable the GPU cursor trail.
+    pub enabled: bool,
+    /// Fast and slow decay in milliseconds.
+    pub decay: CursorTrailDecay,
+    /// Horizontal and vertical movement required to start a trail, in cells.
+    pub start_threshold: CursorTrailThreshold,
+}
+
+#[derive(ConfigDeserialize, Serialize, Copy, Clone, Debug, PartialEq, Default)]
+pub struct CursorTrailDecay {
+    pub fast: u32,
+    pub slow: u32,
+}
+
+#[derive(ConfigDeserialize, Serialize, Copy, Clone, Debug, PartialEq, Default)]
+pub struct CursorTrailThreshold {
+    pub horizontal: u32,
+    pub vertical: u32,
+}
+
+impl CursorTrail {
+    pub fn slow_decay(self) -> u64 {
+        u64::from(self.decay.slow.max(self.decay.fast))
+    }
+
+    pub fn threshold(self) -> (u32, u32) {
+        (self.start_threshold.horizontal, self.start_threshold.vertical)
+    }
+}
+
+impl Default for CursorTrail {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            decay: CursorTrailDecay { fast: 100, slow: 400 },
+            start_threshold: CursorTrailThreshold { horizontal: 2, vertical: 2 },
+        }
+    }
 }
 
 impl Default for Cursor {
@@ -34,6 +79,7 @@ impl Default for Cursor {
             blink_timeout: 5,
             style: Default::default(),
             vi_mode_style: Default::default(),
+            trail: Default::default(),
         }
     }
 }
