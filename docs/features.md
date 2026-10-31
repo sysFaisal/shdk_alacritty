@@ -84,3 +84,11 @@ that.
 Alacritty supports running multiple terminal emulators from the same Alacritty
 instance. New windows can be created either by using the `CreateNewWindow`
 keybinding action, or by executing the `alacritty msg create-window` subcommand.
+
+## Kitty Ported Features (Custom)
+
+This fork includes ports of Kitty's GPU cursor trail and Kitty graphics protocol:
+- **GPU Cursor Trail:** Smooth, exponential ease-out cursor trail animation rendered via OpenGL shader.
+- **Kitty Graphics Protocol:** High-performance image rendering supporting Unicode placeholders (`U=1`) for Yazi and terminal image previews.
+
+For detailed configuration instructions, units, and conversion guides, see [Kitty Features Guide](kitty-features-guide.md).
