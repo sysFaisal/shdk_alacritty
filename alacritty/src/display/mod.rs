@@ -27,6 +27,7 @@ use crossfont::{Rasterize, Rasterizer, Size as FontSize};
 use unicode_width::UnicodeWidthChar;
 
 use alacritty_terminal::event::{EventListener, OnResize, WindowSize};
+use alacritty_terminal::graphics::{PlaceholderTile, diacritic_to_num};
 use alacritty_terminal::grid::Dimensions as TermDimensions;
 use alacritty_terminal::index::{Column, Direction, Line, Point};
 use alacritty_terminal::selection::Selection;
@@ -45,7 +46,7 @@ use crate::config::window::StartupMode;
 use crate::display::bell::VisualBell;
 use crate::display::color::{List, Rgb};
 use crate::display::content::{RenderableContent, RenderableCursor};
-use crate::display::cursor::IntoRects;
+use crate::display::cursor::{CursorTrailState, IntoRects};
 use crate::display::damage::{DamageTracker, damage_y_to_viewport_y};
 use crate::display::hint::{HintMatch, HintState};
 use crate::display::meter::Meter;
@@ -379,6 +380,8 @@ pub struct Display {
     /// The state of the timer for frame scheduling.
     pub frame_timer: FrameTimer,
 
+    pub cursor_trail: CursorTrailState,
+
     /// Damage tracker for the given display.
     pub damage_tracker: DamageTracker,
 
@@ -522,6 +525,7 @@ impl Display {
             surface: ManuallyDrop::new(surface),
             colors: List::from(&config.colors),
             frame_timer: FrameTimer::new(),
+            cursor_trail: CursorTrailState::default(),
             raw_window_handle,
             damage_tracker,
             glyph_cache,
@@ -719,6 +723,7 @@ impl Display {
 
             // Resize terminal.
             terminal.resize(new_size);
+            terminal.set_cell_size(new_size.cell_width(), new_size.cell_height());
 
             // Resize damage tracking.
             self.damage_tracker.resize(new_size.screen_lines(), new_size.columns());
@@ -811,8 +816,29 @@ impl Display {
         }
         terminal.reset_damage();
 
+        let graphics = terminal.graphics.clone();
+
         // Drop terminal as early as possible to free lock.
         drop(terminal);
+
+        for placement in graphics.placements() {
+            let viewport_line = placement.line.0 + display_offset as i32;
+            if viewport_line + (placement.lines as i32) > 0
+                && (viewport_line as usize) < size_info.screen_lines()
+            {
+                let x = size_info.padding_x() + placement.column.0 as f32 * size_info.cell_width();
+                let y = size_info.padding_y() + viewport_line as f32 * size_info.cell_height();
+                let w = placement.columns as f32 * size_info.cell_width();
+                let h = placement.lines as f32 * size_info.cell_height();
+                self.damage_tracker.frame().add_viewport_rect(
+                    &size_info,
+                    x as i32,
+                    y as i32,
+                    w as i32,
+                    h as i32,
+                );
+            }
+        }
 
         // Invalidate highlighted hints if grid has changed.
         self.validate_hint_highlights(display_offset);
@@ -841,6 +867,73 @@ impl Display {
         // Optimize loop hint comparator.
         let has_highlighted_hint =
             self.highlighted_hint.is_some() || self.vi_highlighted_hint.is_some();
+
+        let mut placeholder_tiles = Vec::new();
+        let mut prev_tile: Option<(u32, usize, usize, usize)> = None;
+
+        for cell in &mut grid_cells {
+            if cell.character == '\u{10EEEE}' {
+                let mut image_id =
+                    ((cell.fg.r as u32) << 16) | ((cell.fg.g as u32) << 8) | (cell.fg.b as u32);
+                let (row, col) = if let Some(zerowidth) =
+                    cell.extra.as_ref().and_then(|e| e.zerowidth.as_ref())
+                {
+                    if let Some(&c) = zerowidth.get(2) {
+                        if let Some(msb) = diacritic_to_num(c as u32) {
+                            image_id |= (msb as u32) << 24;
+                        }
+                    }
+                    let r = zerowidth.first().and_then(|&c| diacritic_to_num(c as u32));
+                    let c = zerowidth.get(1).and_then(|&c| diacritic_to_num(c as u32));
+                    match (r, c) {
+                        (Some(r), Some(c)) => (r, c),
+                        (Some(r), None) => {
+                            let c = if let Some((p_id, p_line, _, p_col)) = prev_tile {
+                                if p_id == image_id && p_line == cell.point.line {
+                                    p_col + 1
+                                } else {
+                                    0
+                                }
+                            } else {
+                                0
+                            };
+                            (r, c)
+                        },
+                        (None, _) => {
+                            if let Some((p_id, p_line, p_row, p_col)) = prev_tile {
+                                if p_id == image_id && p_line == cell.point.line {
+                                    (p_row, p_col + 1)
+                                } else {
+                                    (0, 0)
+                                }
+                            } else {
+                                (0, 0)
+                            }
+                        },
+                    }
+                } else if let Some((p_id, p_line, p_row, p_col)) = prev_tile {
+                    if p_id == image_id && p_line == cell.point.line {
+                        (p_row, p_col + 1)
+                    } else {
+                        (0, 0)
+                    }
+                } else {
+                    (0, 0)
+                };
+
+                prev_tile = Some((image_id, cell.point.line, row, col));
+                placeholder_tiles.push(PlaceholderTile {
+                    point: cell.point,
+                    image_id,
+                    row,
+                    col,
+                });
+
+                // Suppress character glyph and diacritics so FreeType doesn't draw '■'
+                cell.character = ' ';
+                cell.extra = None;
+            }
+        }
 
         // Draw grid.
         {
@@ -876,6 +969,73 @@ impl Display {
                 cell
             });
             self.renderer.draw_cells(&size_info, glyph_cache, cells);
+        }
+
+        self.renderer.draw_images(&size_info, &graphics, display_offset, &placeholder_tiles);
+
+        if config.cursor.trail.enabled {
+            let trail = self.cursor_trail.update(
+                cursor,
+                &size_info,
+                config.cursor.thickness(),
+                Instant::now(),
+                config.cursor.trail.decay.fast,
+                config.cursor.trail.decay.slow,
+                config.cursor.trail.threshold(),
+            );
+
+            let current_damage = trail.as_ref().map(|trail| {
+                let min_x =
+                    trail.corners.iter().map(|c| c[0]).fold(trail.cursor_edges[0], f32::min);
+                let max_x =
+                    trail.corners.iter().map(|c| c[0]).fold(trail.cursor_edges[1], f32::max);
+                let min_y =
+                    trail.corners.iter().map(|c| c[1]).fold(trail.cursor_edges[3], f32::min);
+                let max_y =
+                    trail.corners.iter().map(|c| c[1]).fold(trail.cursor_edges[2], f32::max);
+
+                let left =
+                    (((min_x + 1.) * 0.5 * size_info.width()).floor() - 1.).max(0.) as i32;
+                let right = (((max_x + 1.) * 0.5 * size_info.width()).ceil() + 1.)
+                    .min(size_info.width()) as i32;
+                let top =
+                    (((1. - max_y) * 0.5 * size_info.height()).floor() - 1.).max(0.) as i32;
+                let bottom = (((1. - min_y) * 0.5 * size_info.height()).ceil() + 1.)
+                    .min(size_info.height()) as i32;
+                let width = (right - left).max(1);
+                let height = (bottom - top).max(1);
+                (left, top, width, height)
+            });
+
+            if let Some((left, top, width, height)) = self.cursor_trail.damage_rect(current_damage)
+            {
+                self.damage_tracker
+                    .frame()
+                    .add_viewport_rect(&size_info, left, top, width, height);
+                self.damage_tracker
+                    .next_frame()
+                    .add_viewport_rect(&size_info, left, top, width, height);
+            }
+
+            if let Some(trail) = trail {
+                self.renderer.draw_cursor_trail(&size_info, trail);
+            }
+        } else {
+            self.cursor_trail.reset();
+        }
+
+        // Wayland only provides a compositor frame callback after an OS redraw. Cursor-trail
+        // geometry changes without terminal damage, so drive its GPU animation explicitly.
+        if self.cursor_trail.is_animating() {
+            let timer_id = TimerId::new(Topic::CursorTrail, self.window.id());
+            if !scheduler.scheduled(timer_id) {
+                scheduler.schedule(
+                    Event::new(EventType::Frame, self.window.id()),
+                    Duration::from_millis(16),
+                    false,
+                    timer_id,
+                );
+            }
         }
 
         let mut rects = lines.rects(&metrics, &size_info);

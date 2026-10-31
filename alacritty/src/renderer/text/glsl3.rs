@@ -154,6 +154,7 @@ impl<'a> TextRenderer<'a> for Glsl3Renderer {
     where
         F: FnOnce(Self::RenderApi) -> T,
     {
+        self.active_tex = 0;
         unsafe {
             gl::UseProgram(self.program.id());
             self.program.set_term_uniforms(size_info);
@@ -185,6 +186,10 @@ impl<'a> TextRenderer<'a> for Glsl3Renderer {
 
     fn program(&self) -> &Self::Shader {
         &self.program
+    }
+
+    fn reset_active_tex(&mut self) {
+        self.active_tex = 0;
     }
 
     fn loader_api(&mut self) -> LoaderApi<'_> {

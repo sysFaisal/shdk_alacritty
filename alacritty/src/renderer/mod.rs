@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,6 +12,8 @@ use glutin::display::{GetGlDisplay, GlDisplay};
 use log::{LevelFilter, debug, info};
 use unicode_width::UnicodeWidthChar;
 
+use alacritty_terminal::graphics::{GraphicsState, PlaceholderTile};
+use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::Point;
 use alacritty_terminal::term::cell::Flags;
 
@@ -19,9 +21,10 @@ use crate::config::debug::RendererPreference;
 use crate::display::SizeInfo;
 use crate::display::color::Rgb;
 use crate::display::content::RenderableCell;
+use crate::display::cursor::CursorTrail;
 use crate::gl;
 use crate::renderer::rects::{RectRenderer, RenderRect};
-use crate::renderer::shader::ShaderError;
+use crate::renderer::shader::{ShaderError, ShaderProgram};
 
 pub mod platform;
 pub mod rects;
@@ -89,6 +92,8 @@ enum TextRendererProvider {
 pub struct Renderer {
     text_renderer: TextRendererProvider,
     rect_renderer: RectRenderer,
+    trail_renderer: TrailRenderer,
+    image_renderer: ImageRenderer,
     robustness: bool,
 }
 
@@ -150,15 +155,19 @@ impl Renderer {
             None => (shader_version.as_ref() >= "3.3" && !is_gles_context, true),
         };
 
-        let (text_renderer, rect_renderer) = if use_glsl3 {
+        let (text_renderer, rect_renderer, trail_renderer, image_renderer) = if use_glsl3 {
             let text_renderer = TextRendererProvider::Glsl3(Glsl3Renderer::new()?);
             let rect_renderer = RectRenderer::new(ShaderVersion::Glsl3)?;
-            (text_renderer, rect_renderer)
+            let trail_renderer = TrailRenderer::new(ShaderVersion::Glsl3)?;
+            let image_renderer = ImageRenderer::new(ShaderVersion::Glsl3)?;
+            (text_renderer, rect_renderer, trail_renderer, image_renderer)
         } else {
             let text_renderer =
                 TextRendererProvider::Gles2(Gles2Renderer::new(allow_dsb, is_gles_context)?);
             let rect_renderer = RectRenderer::new(ShaderVersion::Gles2)?;
-            (text_renderer, rect_renderer)
+            let trail_renderer = TrailRenderer::new(ShaderVersion::Gles2)?;
+            let image_renderer = ImageRenderer::new(ShaderVersion::Gles2)?;
+            (text_renderer, rect_renderer, trail_renderer, image_renderer)
         };
 
         // Enable debug logging for OpenGL as well.
@@ -171,7 +180,37 @@ impl Renderer {
             }
         }
 
-        Ok(Self { text_renderer, rect_renderer, robustness })
+        Ok(Self { text_renderer, rect_renderer, trail_renderer, image_renderer, robustness })
+    }
+
+    pub fn draw_images(
+        &mut self,
+        size_info: &SizeInfo,
+        graphics: &GraphicsState,
+        display_offset: usize,
+        tiles: &[PlaceholderTile],
+    ) {
+        if graphics.placements().is_empty() && tiles.is_empty() && graphics.images().is_empty() {
+            return;
+        }
+
+        unsafe {
+            gl::Viewport(0, 0, size_info.width() as i32, size_info.height() as i32);
+            gl::Enable(gl::BLEND);
+            gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
+        }
+
+        self.image_renderer.draw(size_info, graphics, display_offset, tiles);
+
+        unsafe {
+            gl::BlendFunc(gl::SRC1_COLOR, gl::ONE_MINUS_SRC1_COLOR);
+            self.set_viewport(size_info);
+        }
+
+        match &mut self.text_renderer {
+            TextRendererProvider::Gles2(renderer) => renderer.reset_active_tex(),
+            TextRendererProvider::Glsl3(renderer) => renderer.reset_active_tex(),
+        }
     }
 
     pub fn draw_cells<I: Iterator<Item = RenderableCell>>(
@@ -264,6 +303,20 @@ impl Renderer {
         }
     }
 
+    /// Draw Kitty's cursor trail as a single GPU-warped quad.
+    pub fn draw_cursor_trail(&self, size_info: &SizeInfo, trail: CursorTrail) {
+        unsafe {
+            gl::Viewport(0, 0, size_info.width() as i32, size_info.height() as i32);
+            gl::Enable(gl::BLEND);
+            gl::BlendFunc(gl::ONE, gl::ONE_MINUS_SRC_ALPHA);
+        }
+        self.trail_renderer.draw(trail);
+        unsafe {
+            gl::BlendFunc(gl::SRC1_COLOR, gl::ONE_MINUS_SRC1_COLOR);
+            self.set_viewport(size_info);
+        }
+    }
+
     /// Fill the window with `color` and `alpha`.
     pub fn clear(&self, color: Rgb, alpha: f32) {
         unsafe {
@@ -345,6 +398,341 @@ impl Renderer {
         match &self.text_renderer {
             TextRendererProvider::Gles2(renderer) => renderer.resize(size_info),
             TextRendererProvider::Glsl3(renderer) => renderer.resize(size_info),
+        }
+    }
+}
+
+const TRAIL_SHADER_V: &str = include_str!("../../res/trail.v.glsl");
+const TRAIL_SHADER_F: &str = include_str!("../../res/trail.f.glsl");
+
+#[derive(Debug)]
+struct TrailRenderer {
+    program: ShaderProgram,
+    vao: gl::types::GLuint,
+    vbo: gl::types::GLuint,
+    cursor_edges: gl::types::GLint,
+    trail_color: gl::types::GLint,
+    trail_opacity: gl::types::GLint,
+}
+
+impl TrailRenderer {
+    fn new(version: ShaderVersion) -> Result<Self, ShaderError> {
+        let program = ShaderProgram::new(version, None, TRAIL_SHADER_V, TRAIL_SHADER_F)?;
+        let cursor_edges = program.get_uniform_location(c"cursorEdges")?;
+        let trail_color = program.get_uniform_location(c"trailColor")?;
+        let trail_opacity = program.get_uniform_location(c"trailOpacity")?;
+        let (mut vao, mut vbo) = (0, 0);
+        unsafe {
+            gl::GenVertexArrays(1, &mut vao);
+            gl::GenBuffers(1, &mut vbo);
+            gl::BindVertexArray(vao);
+            gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
+            gl::BufferData(
+                gl::ARRAY_BUFFER,
+                (4 * 2 * std::mem::size_of::<f32>()) as isize,
+                std::ptr::null(),
+                gl::DYNAMIC_DRAW,
+            );
+            gl::VertexAttribPointer(0, 2, gl::FLOAT, gl::FALSE, 0, std::ptr::null());
+            gl::EnableVertexAttribArray(0);
+            gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+            gl::BindVertexArray(0);
+        }
+        Ok(Self { program, vao, vbo, cursor_edges, trail_color, trail_opacity })
+    }
+
+    fn draw(&self, trail: CursorTrail) {
+        let (r, g, b) = trail.color.as_tuple();
+        unsafe {
+            while gl::GetError() != gl::NO_ERROR {}
+            gl::UseProgram(self.program.id());
+
+            gl::BindBuffer(gl::ARRAY_BUFFER, self.vbo);
+            gl::BufferSubData(
+                gl::ARRAY_BUFFER,
+                0,
+                (4 * 2 * std::mem::size_of::<f32>()) as isize,
+                trail.corners.as_ptr().cast(),
+            );
+            gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+
+            gl::Uniform4fv(self.cursor_edges, 1, trail.cursor_edges.as_ptr());
+            gl::Uniform3f(
+                self.trail_color,
+                f32::from(r) / 255.,
+                f32::from(g) / 255.,
+                f32::from(b) / 255.,
+            );
+            gl::Uniform1f(self.trail_opacity, trail.opacity);
+
+            gl::BindVertexArray(self.vao);
+            gl::DrawArrays(gl::TRIANGLE_FAN, 0, 4);
+            gl::BindVertexArray(0);
+            gl::UseProgram(0);
+        }
+    }
+}
+
+impl Drop for TrailRenderer {
+    fn drop(&mut self) {
+        unsafe {
+            gl::DeleteBuffers(1, &self.vbo);
+            gl::DeleteVertexArrays(1, &self.vao);
+        }
+    }
+}
+
+const IMAGE_SHADER_V: &str = include_str!("../../res/image.v.glsl");
+const IMAGE_SHADER_F: &str = include_str!("../../res/image.f.glsl");
+
+#[derive(Debug)]
+struct ImageRenderer {
+    program: ShaderProgram,
+    vao: gl::types::GLuint,
+    vbo: gl::types::GLuint,
+    textures: HashMap<u32, (gl::types::GLuint, u64)>,
+}
+
+impl ImageRenderer {
+    fn new(version: ShaderVersion) -> Result<Self, ShaderError> {
+        let program = ShaderProgram::new(version, None, IMAGE_SHADER_V, IMAGE_SHADER_F)?;
+        let (mut vao, mut vbo) = (0, 0);
+        unsafe {
+            gl::GenVertexArrays(1, &mut vao);
+            gl::GenBuffers(1, &mut vbo);
+            gl::BindVertexArray(vao);
+            gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
+            gl::BufferData(
+                gl::ARRAY_BUFFER,
+                (4 * 4 * std::mem::size_of::<f32>()) as isize,
+                std::ptr::null(),
+                gl::DYNAMIC_DRAW,
+            );
+            gl::VertexAttribPointer(
+                0,
+                2,
+                gl::FLOAT,
+                gl::FALSE,
+                (4 * std::mem::size_of::<f32>()) as i32,
+                std::ptr::null(),
+            );
+            gl::EnableVertexAttribArray(0);
+
+            gl::VertexAttribPointer(
+                1,
+                2,
+                gl::FLOAT,
+                gl::FALSE,
+                (4 * std::mem::size_of::<f32>()) as i32,
+                (2 * std::mem::size_of::<f32>()) as *const _,
+            );
+            gl::EnableVertexAttribArray(1);
+
+            gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+            gl::BindVertexArray(0);
+        }
+
+        Ok(Self { program, vao, vbo, textures: HashMap::new() })
+    }
+
+    fn draw(
+        &mut self,
+        size_info: &SizeInfo,
+        graphics: &GraphicsState,
+        display_offset: usize,
+        tiles: &[PlaceholderTile],
+    ) {
+        if graphics.placements().is_empty() && tiles.is_empty() && graphics.images().is_empty() {
+            return;
+        }
+
+        unsafe {
+            self.textures.retain(|id, (tex, _)| {
+                if !graphics.images().contains_key(id) {
+                    gl::DeleteTextures(1, tex);
+                    false
+                } else {
+                    true
+                }
+            });
+
+            for (id, img) in graphics.images() {
+                match self.textures.get_mut(id) {
+                    Some((tex, version)) => {
+                        if *version != img.version {
+                            gl::BindTexture(gl::TEXTURE_2D, *tex);
+                            gl::TexImage2D(
+                                gl::TEXTURE_2D,
+                                0,
+                                gl::RGBA as i32,
+                                img.width as i32,
+                                img.height as i32,
+                                0,
+                                gl::RGBA,
+                                gl::UNSIGNED_BYTE,
+                                img.pixels.as_ptr().cast(),
+                            );
+                            gl::BindTexture(gl::TEXTURE_2D, 0);
+                            *version = img.version;
+                        }
+                    },
+                    None => {
+                        let mut tex = 0;
+                        gl::GenTextures(1, &mut tex);
+                        gl::BindTexture(gl::TEXTURE_2D, tex);
+                        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
+                        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
+                        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
+                        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
+                        gl::TexImage2D(
+                            gl::TEXTURE_2D,
+                            0,
+                            gl::RGBA as i32,
+                            img.width as i32,
+                            img.height as i32,
+                            0,
+                            gl::RGBA,
+                            gl::UNSIGNED_BYTE,
+                            img.pixels.as_ptr().cast(),
+                        );
+                        gl::BindTexture(gl::TEXTURE_2D, 0);
+                        self.textures.insert(*id, (tex, img.version));
+                    },
+                }
+            }
+
+            while gl::GetError() != gl::NO_ERROR {}
+            gl::UseProgram(self.program.id());
+            gl::Enable(gl::BLEND);
+            gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
+            gl::BindVertexArray(self.vao);
+
+            let mut current_bound_tex = 0;
+
+            // 1. Draw direct placements
+            for placement in graphics.placements() {
+                let Some(&(tex, _)) = self.textures.get(&placement.image_id) else { continue };
+                let Some(img) = graphics.images().get(&placement.image_id) else { continue };
+
+                let viewport_line = placement.line.0 + display_offset as i32;
+                if viewport_line + (placement.lines as i32) <= 0
+                    || viewport_line as usize >= size_info.screen_lines()
+                {
+                    continue;
+                }
+
+                let x = size_info.padding_x() + placement.column.0 as f32 * size_info.cell_width();
+                let y = size_info.padding_y() + viewport_line as f32 * size_info.cell_height();
+                let w = placement.columns as f32 * size_info.cell_width();
+                let h = placement.lines as f32 * size_info.cell_height();
+
+                let left_ndc = (x / size_info.width()) * 2.0 - 1.0;
+                let right_ndc = ((x + w) / size_info.width()) * 2.0 - 1.0;
+                let top_ndc = 1.0 - (y / size_info.height()) * 2.0;
+                let bottom_ndc = 1.0 - ((y + h) / size_info.height()) * 2.0;
+
+                let src_w = if placement.src_w > 0 {
+                    placement.src_w
+                } else {
+                    img.width.saturating_sub(placement.src_x).max(1)
+                };
+                let src_h = if placement.src_h > 0 {
+                    placement.src_h
+                } else {
+                    img.height.saturating_sub(placement.src_y).max(1)
+                };
+
+                let u0 = placement.src_x as f32 / img.width.max(1) as f32;
+                let v0 = placement.src_y as f32 / img.height.max(1) as f32;
+                let u1 = (placement.src_x + src_w) as f32 / img.width.max(1) as f32;
+                let v1 = (placement.src_y + src_h) as f32 / img.height.max(1) as f32;
+
+                let quad: [f32; 16] = [
+                    left_ndc, top_ndc, u0, v0,
+                    left_ndc, bottom_ndc, u0, v1,
+                    right_ndc, bottom_ndc, u1, v1,
+                    right_ndc, top_ndc, u1, v0,
+                ];
+
+                if current_bound_tex != tex {
+                    gl::BindTexture(gl::TEXTURE_2D, tex);
+                    current_bound_tex = tex;
+                }
+
+                gl::BindBuffer(gl::ARRAY_BUFFER, self.vbo);
+                gl::BufferSubData(
+                    gl::ARRAY_BUFFER,
+                    0,
+                    (16 * std::mem::size_of::<f32>()) as isize,
+                    quad.as_ptr().cast(),
+                );
+                gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+
+                gl::DrawArrays(gl::TRIANGLE_FAN, 0, 4);
+            }
+
+            // 2. Draw Unicode placeholder tiles (U=1)
+            for tile in tiles {
+                let Some(&(tex, _)) = self.textures.get(&tile.image_id) else { continue };
+                let vp = graphics.virtual_placements().get(&tile.image_id);
+                let total_cols = vp.map_or(1, |v| v.columns.max(1));
+                let total_lines = vp.map_or(1, |v| v.lines.max(1));
+
+                let u0 = (tile.col as f32) / (total_cols as f32);
+                let u1 = ((tile.col + 1) as f32) / (total_cols as f32);
+                let v0 = (tile.row as f32) / (total_lines as f32);
+                let v1 = ((tile.row + 1) as f32) / (total_lines as f32);
+
+                let x = size_info.padding_x() + tile.point.column.0 as f32 * size_info.cell_width();
+                let y = size_info.padding_y() + tile.point.line as f32 * size_info.cell_height();
+                let w = size_info.cell_width();
+                let h = size_info.cell_height();
+
+                let left_ndc = (x / size_info.width()) * 2.0 - 1.0;
+                let right_ndc = ((x + w) / size_info.width()) * 2.0 - 1.0;
+                let top_ndc = 1.0 - (y / size_info.height()) * 2.0;
+                let bottom_ndc = 1.0 - ((y + h) / size_info.height()) * 2.0;
+
+                let quad: [f32; 16] = [
+                    left_ndc, top_ndc, u0, v0,
+                    left_ndc, bottom_ndc, u0, v1,
+                    right_ndc, bottom_ndc, u1, v1,
+                    right_ndc, top_ndc, u1, v0,
+                ];
+
+                if current_bound_tex != tex {
+                    gl::BindTexture(gl::TEXTURE_2D, tex);
+                    current_bound_tex = tex;
+                }
+
+                gl::BindBuffer(gl::ARRAY_BUFFER, self.vbo);
+                gl::BufferSubData(
+                    gl::ARRAY_BUFFER,
+                    0,
+                    (16 * std::mem::size_of::<f32>()) as isize,
+                    quad.as_ptr().cast(),
+                );
+                gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+
+                gl::DrawArrays(gl::TRIANGLE_FAN, 0, 4);
+            }
+
+            gl::ActiveTexture(gl::TEXTURE0);
+            gl::BindTexture(gl::TEXTURE_2D, 0);
+            gl::BindVertexArray(0);
+            gl::UseProgram(0);
+        }
+    }
+}
+
+impl Drop for ImageRenderer {
+    fn drop(&mut self) {
+        unsafe {
+            for (_, (tex, _)) in &self.textures {
+                gl::DeleteTextures(1, tex);
+            }
+            gl::DeleteBuffers(1, &self.vbo);
+            gl::DeleteVertexArrays(1, &self.vao);
         }
     }
 }

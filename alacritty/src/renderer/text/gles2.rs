@@ -181,6 +181,7 @@ impl<'a> TextRenderer<'a> for Gles2Renderer {
     where
         F: FnOnce(Self::RenderApi) -> T,
     {
+        self.active_tex = 0;
         unsafe {
             gl::UseProgram(self.program.id());
             gl::BindVertexArray(self.vao);
@@ -207,6 +208,10 @@ impl<'a> TextRenderer<'a> for Gles2Renderer {
         }
 
         res
+    }
+
+    fn reset_active_tex(&mut self) {
+        self.active_tex = 0;
     }
 
     fn loader_api(&mut self) -> LoaderApi<'_> {

@@ -54,6 +54,9 @@ pub trait TextRenderer<'a> {
     /// Get loader API for the renderer.
     fn loader_api(&mut self) -> LoaderApi<'_>;
 
+    /// Reset cached active texture state.
+    fn reset_active_tex(&mut self);
+
     /// Draw cells.
     fn draw_cells<'b: 'a, I: Iterator<Item = RenderableCell>>(
         &'b mut self,
