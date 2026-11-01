@@ -12,8 +12,10 @@ edition = "2024"
 rust-version = "1.85.0"
 
 [profile.release]
-lto = "thin"
-debug = 1
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
 incremental = false
 
 [workspace.dependencies]
