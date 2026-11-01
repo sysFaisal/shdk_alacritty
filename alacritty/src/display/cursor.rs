@@ -104,6 +104,8 @@ impl CursorTrailState {
         } else {
             self.updated_at.map_or(0.016, |at| now.saturating_duration_since(at).as_secs_f32())
         };
+        // Clamp dt to prevent visual glitches on frame spikes or background tab switches.
+        let dt = dt.clamp(0.001, 0.05);
         self.updated_at = Some(now);
 
         let cell_x = 2. * size.cell_width() / size.width();

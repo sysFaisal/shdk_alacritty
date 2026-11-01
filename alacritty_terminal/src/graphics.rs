@@ -205,6 +205,9 @@ pub struct PlaceholderTile {
     pub col: usize,
 }
 
+pub const MAX_GRAPHICS_PAYLOAD_SIZE: usize = 128 * 1024 * 1024; // 128 MB
+pub const MAX_STORED_IMAGE_BYTES: usize = 256 * 1024 * 1024; // 256 MB LRU image memory cap
+
 /// State tracking images, placements, and chunked transfer buffers.
 #[derive(Default, Debug, Clone)]
 pub struct GraphicsState {
@@ -214,6 +217,7 @@ pub struct GraphicsState {
     chunk_buffer: Option<GraphicsCommand>,
     next_auto_id: u32,
     next_image_version: u64,
+    total_pixels_bytes: usize,
 }
 
 impl GraphicsState {
@@ -287,9 +291,13 @@ impl GraphicsState {
                             self.images.clear();
                             self.placements.clear();
                             self.virtual_placements.clear();
+                            self.total_pixels_bytes = 0;
                         },
                         'i' | 'I' if full_cmd.id > 0 => {
-                            self.images.remove(&full_cmd.id);
+                            if let Some(removed) = self.images.remove(&full_cmd.id) {
+                                self.total_pixels_bytes =
+                                    self.total_pixels_bytes.saturating_sub(removed.pixels.len());
+                            }
                             self.placements.retain(|p| p.image_id != full_cmd.id);
                             self.virtual_placements.remove(&full_cmd.id);
                         },
@@ -303,13 +311,17 @@ impl GraphicsState {
                         _ => {},
                     }
                 } else if full_cmd.id > 0 {
-                    self.images.remove(&full_cmd.id);
+                    if let Some(removed) = self.images.remove(&full_cmd.id) {
+                        self.total_pixels_bytes =
+                            self.total_pixels_bytes.saturating_sub(removed.pixels.len());
+                    }
                     self.placements.retain(|p| p.image_id != full_cmd.id);
                     self.virtual_placements.remove(&full_cmd.id);
                 } else {
                     self.images.clear();
                     self.placements.clear();
                     self.virtual_placements.clear();
+                    self.total_pixels_bytes = 0;
                 }
                 (None, None)
             },
@@ -393,7 +405,8 @@ impl GraphicsState {
                 };
 
                 self.next_image_version = self.next_image_version.wrapping_add(1);
-                self.images.insert(
+                let pixel_len = pixels.len();
+                if let Some(old) = self.images.insert(
                     image_id,
                     StoredImage {
                         id: image_id,
@@ -402,7 +415,34 @@ impl GraphicsState {
                         pixels: Arc::from(pixels),
                         version: self.next_image_version,
                     },
-                );
+                ) {
+                    self.total_pixels_bytes =
+                        self.total_pixels_bytes.saturating_sub(old.pixels.len());
+                }
+                self.total_pixels_bytes += pixel_len;
+
+                // Evict unreferenced images if memory budget is exceeded
+                if self.total_pixels_bytes > MAX_STORED_IMAGE_BYTES {
+                    let unpinned: Vec<u32> = self
+                        .images
+                        .keys()
+                        .copied()
+                        .filter(|&id| {
+                            id != image_id
+                                && !self.placements.iter().any(|p| p.image_id == id)
+                                && !self.virtual_placements.contains_key(&id)
+                        })
+                        .collect();
+                    for unpinned_id in unpinned {
+                        if self.total_pixels_bytes <= MAX_STORED_IMAGE_BYTES {
+                            break;
+                        }
+                        if let Some(removed) = self.images.remove(&unpinned_id) {
+                            self.total_pixels_bytes =
+                                self.total_pixels_bytes.saturating_sub(removed.pixels.len());
+                        }
+                    }
+                }
 
                 let cursor_advance = if action == Action::TransmitAndDisplay {
                     let src_w = if full_cmd.src_width > 0 {
@@ -424,7 +464,13 @@ impl GraphicsState {
                         cell_height,
                     );
                     
-                    if !full_cmd.unicode_placement {
+                    if full_cmd.unicode_placement {
+                        self.virtual_placements.insert(
+                            image_id,
+                            VirtualPlacement { columns: cols, lines },
+                        );
+                        None // Don't move cursor for U=1
+                    } else {
                         self.placements.push(ImagePlacement {
                             image_id,
                             placement_id: full_cmd.placement_id,
@@ -439,12 +485,6 @@ impl GraphicsState {
                             src_h: full_cmd.src_height,
                         });
                         (!full_cmd.cursor_movement).then_some((cols, lines, false))
-                    } else {
-                        self.virtual_placements.insert(
-                            image_id,
-                            VirtualPlacement { columns: cols, lines },
-                        );
-                        None // Don't move cursor for U=1
                     }
                 } else {
                     None
@@ -497,27 +537,22 @@ fn compute_dimensions(
     }
 }
 
+fn decode_base64(payload: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if payload.iter().any(|b| b.is_ascii_whitespace()) {
+        let filtered: Vec<u8> =
+            payload.iter().copied().filter(|b| !b.is_ascii_whitespace()).collect();
+        Base64.decode(&filtered).map_err(|_| "Base64 decode failed")
+    } else {
+        Base64.decode(payload).map_err(|_| "Base64 decode failed")
+    }
+}
+
 fn decode_payload(cmd: &GraphicsCommand) -> Result<(u32, u32, Vec<u8>), &'static str> {
     let medium = cmd.medium.unwrap_or(Medium::Direct);
-    let raw_bytes = match medium {
-        Medium::Direct => {
-            // Strip whitespace/newlines from base64
-            let filtered: Vec<u8> = cmd
-                .payload
-                .iter()
-                .copied()
-                .filter(|b| !b.is_ascii_whitespace())
-                .collect();
-            Base64.decode(&filtered).map_err(|_| "Base64 decode failed")?
-        },
+    let mut raw_bytes = match medium {
+        Medium::Direct => decode_base64(&cmd.payload)?,
         Medium::File | Medium::TempFile => {
-            let filtered: Vec<u8> = cmd
-                .payload
-                .iter()
-                .copied()
-                .filter(|b| !b.is_ascii_whitespace())
-                .collect();
-            let path_bytes = Base64.decode(&filtered).unwrap_or_else(|_| cmd.payload.clone());
+            let path_bytes = decode_base64(&cmd.payload).unwrap_or_else(|_| cmd.payload.clone());
             let path_str = std::str::from_utf8(&path_bytes).map_err(|_| "Invalid file path")?;
             let path = path_str.trim();
             let data = std::fs::read(path).map_err(|_| "File read failed")?;
@@ -527,13 +562,8 @@ fn decode_payload(cmd: &GraphicsCommand) -> Result<(u32, u32, Vec<u8>), &'static
             data
         },
         Medium::SharedMemory => {
-            let filtered: Vec<u8> = cmd
-                .payload
-                .iter()
-                .copied()
-                .filter(|b| !b.is_ascii_whitespace())
-                .collect();
-            let name_bytes = Base64.decode(&filtered).map_err(|_| "Base64 decode failed for SHM name")?;
+            let name_bytes =
+                decode_base64(&cmd.payload).map_err(|_| "Base64 decode failed for SHM name")?;
             let name_str = std::str::from_utf8(&name_bytes).map_err(|_| "Invalid SHM name")?;
             let name = name_str.trim();
             read_shm(name, cmd.data_sz as usize)?
@@ -553,7 +583,8 @@ fn decode_payload(cmd: &GraphicsCommand) -> Result<(u32, u32, Vec<u8>), &'static
             if raw_bytes.len() < expected_len {
                 return Err("RGBA payload truncated");
             }
-            Ok((w, h, raw_bytes[..expected_len].to_vec()))
+            raw_bytes.truncate(expected_len);
+            Ok((w, h, raw_bytes))
         },
         Format::Rgb => {
             let w = cmd.width;
@@ -577,6 +608,7 @@ fn decode_payload(cmd: &GraphicsCommand) -> Result<(u32, u32, Vec<u8>), &'static
     }
 }
 
+#[cfg(target_family = "unix")]
 fn read_shm(name: &str, hint_size: usize) -> Result<Vec<u8>, &'static str> {
     use std::ffi::CString;
     let cname = CString::new(name).map_err(|_| "Invalid SHM name")?;
@@ -601,6 +633,11 @@ fn read_shm(name: &str, hint_size: usize) -> Result<Vec<u8>, &'static str> {
             return Err("SHM has zero size");
         };
 
+        if size > MAX_GRAPHICS_PAYLOAD_SIZE {
+            libc::close(fd);
+            return Err("SHM payload size exceeds maximum limit");
+        }
+
         let ptr = libc::mmap(
             std::ptr::null_mut(),
             size,
@@ -623,6 +660,11 @@ fn read_shm(name: &str, hint_size: usize) -> Result<Vec<u8>, &'static str> {
     }
 }
 
+#[cfg(not(target_family = "unix"))]
+fn read_shm(_name: &str, _hint_size: usize) -> Result<Vec<u8>, &'static str> {
+    Err("Shared memory transport is not supported on this platform")
+}
+
 fn decode_png(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), &'static str> {
     let decoder = png::Decoder::new(Cursor::new(bytes));
     let mut reader = decoder.read_info().map_err(|_| "PNG header decode failed")?;
@@ -632,7 +674,10 @@ fn decode_png(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), &'static str> {
     let height = info.height;
 
     let rgba = match info.color_type {
-        png::ColorType::Rgba => buf[..info.buffer_size()].to_vec(),
+        png::ColorType::Rgba => {
+            buf.truncate(info.buffer_size());
+            buf
+        },
         png::ColorType::Rgb => {
             let mut out = Vec::with_capacity((width * height * 4) as usize);
             for chunk in buf[..info.buffer_size()].chunks_exact(3) {
@@ -738,7 +783,11 @@ impl GraphicsStreamParser {
                     }
                 },
                 StreamState::KittyGraphics => {
-                    if b == 0x07 {
+                    if self.buffer.len() >= MAX_GRAPHICS_PAYLOAD_SIZE {
+                        self.buffer.clear();
+                        self.state = StreamState::Ground;
+                        normal_start = i + 1;
+                    } else if b == 0x07 {
                         let payload = std::mem::take(&mut self.buffer);
                         callback(GraphicsStreamItem::Graphics(payload));
                         self.state = StreamState::Ground;
