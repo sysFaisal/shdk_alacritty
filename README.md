@@ -1,5 +1,5 @@
 # shdk_alacritty
-
+ww
 just my personal fork of [alacritty](https://github.com/alacritty/alacritty) where i slapped together a few things i wanted for my own setup.
 
 basically:
